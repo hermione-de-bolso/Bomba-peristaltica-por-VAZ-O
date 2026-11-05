@@ -1,0 +1,6 @@
+// Exemplo de como deve ficar a lógica do slider:
+document.getElementById('sliderVazao').addEventListener('input', (e) => {
+    document.getElementById('vazaoAtual').innerText = e.target.value;
+    // Envia o comando "V" seguido do valor de vazão (ex: V48.5)
+    enviarComando("V" + e.target.value); 
+});
