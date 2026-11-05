@@ -1,0 +1,12 @@
+function processaStatus(linha) {
+    // Exemplo: linha = "ST 48.5 0 10.0 2.0 1 0 1 1"
+    let partes = linha.split(' ');
+    if (partes[0] === 'ST') {
+        let vazaoSalva = partes[1];
+        // Atualiza o slider e o texto na tela com o valor real vindo do Arduino
+        document.getElementById('sliderVazao').value = vazaoSalva;
+        document.getElementById('vazaoAtual').innerText = vazaoSalva;
+
+        // ... restante do seu código que trata os outros botões/modos ...
+    }
+}
