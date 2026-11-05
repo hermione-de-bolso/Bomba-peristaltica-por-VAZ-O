@@ -1,0 +1,240 @@
+/*
+  Controle de bomba peristáltica por VAZÃO (mL/min) com NEMA 17 e DRV8825
+  Placa: Arduino Uno
+*/
+
+#include <EEPROM.h>
+
+#define PIN_STEP   2
+#define PIN_DIR    5
+#define PIN_ENABLE 8
+
+const int   PASSOS_POR_VOLTA = 200;  
+const int   MICROPASSOS      = 1;    
+const float ACEL_RPS2        = 5.0;  
+
+// Parâmetros da Regressão Linear (Calibração)
+const float COEF_ANGULAR = 0.6456; // mL por volta
+const float COEF_LINEAR  = 9.8167; // Interseção teórica
+
+// Limites convertidos (Baseados em 10 RPM e 420 RPM do ensaio)
+const float VAZAO_MIN    = 16.3;   // (10 * 0.6456) + 9.8167
+const float VAZAO_MAX    = 281.0;  // (420 * 0.6456) + 9.8167
+
+const float SPR       = (float)PASSOS_POR_VOLTA * MICROPASSOS;  
+const float ACEL      = ACEL_RPS2 * SPR;                        
+const float V_PARTIDA = SPR / 4.0;                              
+
+struct Config {
+  uint8_t magic;
+  uint8_t autoTeste;
+  uint8_t modoDir;            
+  float vazao;                // Salva em mL/min em vez de RPM
+  unsigned long tempoMs;      
+  unsigned long intervaloMs;  
+};
+const uint8_t MAGIC = 0x5C;   // Alterado para forçar reset da EEPROM antiga
+Config cfg;
+
+bool rodando = false, parando = false, invertendo = false, alternar = false;
+bool driverOn = true;
+bool sentidoAtual = true;   
+float v = 0;                // velocidade atual em passos/s
+unsigned long tInicio, tSegmento, tUltimoPasso, tUltimaAcel;
+long passosAlvo = -1, passosFeitos = 0;   
+
+uint8_t etapaTeste = 0;
+unsigned long tEtapa;
+char buf[24];
+uint8_t nbuf = 0;
+
+// Função crucial: Converte a Vazão desejada (mL/min) para o RPM mecânico necessário
+float converteVazaoParaRPM(float vazao) {
+  float rpm = (vazao - COEF_LINEAR) / COEF_ANGULAR;
+  if (rpm < 1.0) rpm = 1.0; // Evita valores negativos ou nulos de rotação
+  return rpm;
+}
+
+void salvar()  { EEPROM.put(0, cfg); }
+
+void carregar() {
+  EEPROM.get(0, cfg);
+  if (cfg.magic != MAGIC || cfg.vazao < VAZAO_MIN || cfg.vazao > VAZAO_MAX || cfg.modoDir > 2) {
+    cfg.magic = MAGIC;
+    cfg.autoTeste = 1;
+    cfg.modoDir = 0;
+    cfg.vazao = 48.5; // Inicia com ~48.5 mL/min (equivalente a 60 RPM antigo)
+    cfg.tempoMs = 0;
+    cfg.intervaloMs = 2000;
+    salvar();
+  }
+}
+
+void status() {
+  Serial.print(F("ST "));
+  Serial.print(cfg.vazao, 1);            Serial.print(' '); // Retorna Vazão em vez de RPM
+  Serial.print(cfg.modoDir);             Serial.print(' ');
+  Serial.print(cfg.tempoMs / 1000.0, 1); Serial.print(' ');
+  Serial.print(cfg.intervaloMs / 1000.0, 1); Serial.print(' ');
+  Serial.print(cfg.autoTeste);           Serial.print(' ');
+  Serial.print(rodando ? 1 : 0);         Serial.print(' ');
+  Serial.print(driverOn ? 1 : 0);        Serial.print(' ');
+  Serial.println(sentidoAtual ? 1 : 0);
+}
+
+// Determina a velocidade de passos baseada na conversão de Vazão -> RPM
+float vAlvo() { 
+  float rpmNecessario = converteVazaoParaRPM(cfg.vazao);
+  return rpmNecessario * SPR / 60.0; 
+}
+
+void aplicaSentido(bool horario) {
+  sentidoAtual = horario;
+  digitalWrite(PIN_DIR, horario ? HIGH : LOW);
+  delayMicroseconds(5);
+}
+
+void habilitar(bool on) {
+  driverOn = on;
+  digitalWrite(PIN_ENABLE, on ? LOW : HIGH);
+  if (!on && rodando) { rodando = false; v = 0; etapaTeste = 0; }
+}
+
+void iniciar(long passos, bool horario, bool alterna) {
+  if (!driverOn) habilitar(true);
+  passosAlvo = passos;
+  passosFeitos = 0;
+  parando = false;
+  invertendo = false;
+  alternar = alterna;
+  aplicaSentido(horario);
+  v = min(V_PARTIDA, vAlvo());
+  tInicio = tSegmento = millis();
+  tUltimoPasso = tUltimaAcel = micros();
+  rodando = true;
+  status();
+}
+
+void iniciarTempo() {
+  iniciar(-1, cfg.modoDir != 1, cfg.modoDir == 2);
+}
+
+void iniciarVoltas(float voltas) {
+  long passos = (long)(fabs(voltas) * SPR);
+  if (passos <= 0) return;
+  iniciar(passos, voltas >= 0, false);
+}
+
+void fim() {
+  rodando = false;
+  v = 0;
+  status();
+  if (etapaTeste == 1)      { etapaTeste = 2; tEtapa = millis(); }
+  else if (etapaTeste == 3) { etapaTeste = 0; Serial.println(F("MSG Teste automatico concluido")); }
+}
+
+void atualizaMotor() {
+  if (!rodando) return;
+  unsigned long agora = micros();
+  unsigned long ms = millis();
+
+  if (passosAlvo < 0) {
+    if (cfg.tempoMs > 0 && ms - tInicio >= cfg.tempoMs) parando = true;
+    if (alternar && !parando && !invertendo && ms - tSegmento >= cfg.intervaloMs) invertendo = true;
+  }
+
+  float alvo = vAlvo();
+  if (parando || invertendo) {
+    alvo = 0;
+  } else if (passosAlvo >= 0) {
+    long restante = passosAlvo - passosFeitos;
+    if (restante <= 0) { fim(); return; }
+    if (v * v / (2.0 * ACEL) >= restante) alvo = 0;  
+  }
+
+  float dt = (agora - tUltimaAcel) * 1e-6;
+  tUltimaAcel = agora;
+  if (v < alvo)      { v += ACEL * dt; if (v > alvo) v = alvo; }
+  else if (v > alvo) { v -= ACEL * dt; if (v < alvo) v = alvo; }
+
+  float vMin = min(V_PARTIDA, vAlvo());
+  if (v < vMin) {
+    if (parando) { fim(); return; }
+    if (invertendo) {
+      aplicaSentido(!sentidoAtual);
+      invertendo = false;
+      tSegmento = millis();
+      status();
+    }
+    v = vMin;
+  }
+
+  unsigned long periodo = (unsigned long)(1000000.0 / v);
+  if (agora - tUltimoPasso >= periodo) {
+    tUltimoPasso += periodo;
+    if (agora - tUltimoPasso > periodo) tUltimoPasso = agora;
+    digitalWrite(PIN_STEP, HIGH);
+    delayMicroseconds(3);
+    digitalWrite(PIN_STEP, LOW);
+    passosFeitos++;
+  }
+}
+
+void processa(char *linha) {
+  char c = toupper(linha[0]);
+  float valor = atof(linha + 1);
+
+  switch (c) {
+    case 'V': cfg.vazao = constrain(valor, VAZAO_MIN, VAZAO_MAX); salvar(); break;
+    case 'M': cfg.modoDir = constrain((int)valor, 0, 2); salvar(); break;
+    case 'T': cfg.tempoMs = (unsigned long)(constrain(valor, 0, 86400) * 1000); salvar(); break;
+    case 'I': cfg.intervaloMs = (unsigned long)(constrain(valor, 0.5, 3600) * 1000); salvar(); break;
+    case 'A': cfg.autoTeste = valor > 0 ? 1 : 0; salvar(); break;
+    case 'E': habilitar(valor > 0); break;
+    case 'R': etapaTeste = 0; iniciarTempo(); return;
+    case 'G': etapaTeste = 0; iniciarVoltas(valor); return;
+    case 'S': etapaTeste = 0; if (rodando) parando = true; break;
+    case '?': break;
+    default:  Serial.println(F("MSG Comando desconhecido")); return;
+  }
+  status();
+}
+
+void leSerial() {
+  while (Serial.available()) {
+    char c = Serial.read();
+    if (c == '\n' || c == '\r') {
+      if (nbuf) { buf[nbuf] = 0; processa(buf); nbuf = 0; }
+    } else if (nbuf < sizeof(buf) - 1) {
+      buf[nbuf++] = c;
+    }
+  }
+}
+
+void setup() {
+  Serial.begin(115200);
+  pinMode(PIN_STEP, OUTPUT);
+  pinMode(PIN_DIR, OUTPUT);
+  pinMode(PIN_ENABLE, OUTPUT);
+  digitalWrite(PIN_STEP, LOW);
+  habilitar(true);
+  carregar();
+
+  Serial.println(F("MSG Bomba Peristaltica Pronta para Controle por Vazao"));
+  status();
+
+  if (cfg.autoTeste) {
+    etapaTeste = 1;
+    iniciarVoltas(1.0);
+  }
+}
+
+void loop() {
+  leSerial();
+  atualizaMotor();
+
+  if (etapaTeste == 2 && !rodando && millis() - tEtapa >= 1000) {
+    etapaTeste = 3;
+    iniciarVoltas(-1.0);
+  }
+}
